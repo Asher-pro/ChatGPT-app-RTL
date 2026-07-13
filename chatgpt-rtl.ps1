@@ -37,6 +37,9 @@ $VersionFile  = Join-Path $SupportDir 'patched-version'
 $LogFile      = Join-Path $SupportDir 'updater.log'
 $TaskName     = 'ChatGPT RTL Updater'
 $ShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'ChatGPT RTL.lnk'
+# Canonical location of this script, used by the auto-updater when the tool is
+# run piped (irm | iex) and therefore has no copy of itself on disk.
+$RawUrl       = if ($env:CHATGPT_RTL_RAW_URL) { $env:CHATGPT_RTL_RAW_URL } else { 'https://raw.githubusercontent.com/Asher-pro/ChatGPT-app-RTL/main/chatgpt-rtl.ps1' }
 
 function Info($m) { if (-not $Auto) { Write-Host "==> $m" -ForegroundColor Cyan } }
 function Ok($m)   { if (-not $Auto) { Write-Host " ok $m" -ForegroundColor Green } }
@@ -316,8 +319,10 @@ function Install-Watch {
   if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
     Copy-Item -Force $PSCommandPath $SelfCopy
   } else {
-    Info "note: run from a saved .ps1 file to enable auto-updates"
-    return
+    # Piped install (irm | iex) — fetch a copy so the updater can re-run it.
+    Info "Fetching script for the auto-updater"
+    try { Invoke-WebRequest -UseBasicParsing -Uri $RawUrl -OutFile $SelfCopy }
+    catch { Info "note: couldn't fetch the updater script; auto-update disabled (re-run the installer after app updates)"; return }
   }
 
   $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `

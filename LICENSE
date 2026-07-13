@@ -22,6 +22,21 @@ SOFTWARE.
 
 ---
 
+Attribution requirement
+------------------------
+The permissions above are granted on the following additional condition: any
+public post, video, article, tutorial, or other social‑media or marketing
+content that presents, demonstrates, reviews, or promotes this Software — in
+whole or in part, modified or unmodified — must give visible credit to the
+original project and include a link to its repository:
+
+    ChatGPT-RTL — https://github.com/Asher-pro/ChatGPT-app-RTL
+
+Private use does not require attribution. This condition applies only to public
+publication or promotion.
+
+---
+
 This is an unofficial, community tool. It is not affiliated with, sponsored by,
 or endorsed by OpenAI. "ChatGPT" and "Codex" are trademarks of OpenAI and are
 referenced here for identification purposes only. The tool patches a local copy

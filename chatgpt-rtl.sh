@@ -26,6 +26,9 @@ VERSION_FILE="$SUPPORT_DIR/patched-version"
 LOG_FILE="$SUPPORT_DIR/updater.log"
 AGENT_LABEL="com.chatgpt-rtl.updater"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+# Canonical location of this script, used by the auto-updater when the tool is
+# run piped (curl | bash) and therefore has no copy of itself on disk.
+RAW_URL="${CHATGPT_RTL_RAW_URL:-https://raw.githubusercontent.com/Asher-pro/ChatGPT-app-RTL/main/chatgpt-rtl.sh}"
 
 ACTION="install"
 DO_WATCH=1
@@ -289,13 +292,20 @@ build() {
 install_watch() {
   # Keep an on-disk copy of this script so the LaunchAgent can re-run it.
   mkdir -p "$SUPPORT_DIR"
-  if [ -f "${BASH_SOURCE[0]}" ]; then
-    cp "${BASH_SOURCE[0]}" "$SELF_COPY"
-  elif [ -f "$0" ]; then
-    cp "$0" "$SELF_COPY"
-  else
-    info "note: run from a saved file to enable auto-updates (piped stdin can't self-install the watcher)"
-    return 0
+  local src=""
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    src="${BASH_SOURCE[0]}"
+  elif [ -f "$0" ] && [ "$0" != "bash" ] && [ "$0" != "-bash" ]; then
+    src="$0"
+  fi
+  if [ -n "$src" ]; then
+    cp "$src" "$SELF_COPY" 2>/dev/null || :
+  fi
+  if [ ! -f "$SELF_COPY" ]; then
+    # Piped install (curl | bash) — fetch a copy so the updater can re-run it.
+    info "Fetching script for the auto-updater"
+    curl -fsSL "$RAW_URL" -o "$SELF_COPY" 2>/dev/null \
+      || { info "note: couldn't fetch the updater script; auto-update disabled (re-run the installer after app updates)"; return 0; }
   fi
   chmod +x "$SELF_COPY"
 
@@ -350,7 +360,15 @@ restore() {
 }
 
 usage() {
-  sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  if [ -f "${BASH_SOURCE[0]}" ]; then
+    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  else
+    printf '%s\n' \
+      "chatgpt-rtl — build a right-to-left copy of the ChatGPT desktop app." \
+      "  bash chatgpt-rtl.sh            build the RTL app + auto-updater" \
+      "  bash chatgpt-rtl.sh --no-watch build without the auto-updater" \
+      "  bash chatgpt-rtl.sh --restore  remove the RTL app + updater"
+  fi
 }
 
 # --------------------------------- dispatch ----------------------------------

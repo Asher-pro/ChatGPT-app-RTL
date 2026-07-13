@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Node / tooling
+node_modules/
+npm-debug.log*
+
+# Local build/scratch artifacts
+*.asar
+*.asar.unpacked/
+app-extracted*/
+scratch/
+tmp/

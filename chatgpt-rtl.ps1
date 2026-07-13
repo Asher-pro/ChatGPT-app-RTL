@@ -32,6 +32,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# When piped into PowerShell (irm | iex) the session runs under the machine's
+# default policy, which is usually Restricted and blocks npm/npx - on Windows
+# those are .ps1 shims, so calling them fails with "running scripts is disabled".
+# Relax the policy for THIS process only: no admin required, not persisted, and
+# it also overrides a session started with -ExecutionPolicy Restricted.
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue } catch {}
+
 # ------------------------------- configuration -------------------------------
 $AppName      = 'ChatGPT'
 $DestRoot     = Join-Path $env:LOCALAPPDATA 'ChatGPT-RTL'

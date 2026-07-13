@@ -60,6 +60,31 @@ function Use-NativeErrors {
   try { & $Command } finally { $ErrorActionPreference = $prev }
 }
 
+# The copied app nests node_modules deep enough to exceed the classic 260-char
+# MAX_PATH limit, and Remove-Item cannot delete those paths ("Could not find a
+# part of the path ..."). robocopy uses long-path-aware APIs, so mirroring an
+# empty directory over the target clears everything inside; then the now-empty
+# top folder deletes normally.
+function Remove-Tree {
+  param([Parameter(Mandatory)][string]$Path)
+  # -LiteralPath throughout: on a non-ASCII profile (e.g. a Hebrew user name)
+  # TEMP can be an 8.3 short path like C:\Users\2922~1\..., and the tilde would
+  # be misread by the wildcard-aware -Path. Cleanup must never throw, so guarded.
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop; return } catch {}
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  # Long-path fallback: the copied app nests node_modules past MAX_PATH, which
+  # Remove-Item cannot delete. robocopy is long-path aware, so mirroring an empty
+  # directory over the target clears everything inside; then the shell removes it.
+  try {
+    $empty = Join-Path ([System.IO.Path]::GetTempPath()) ('cgptrtl_empty_' + [guid]::NewGuid())
+    New-Item -ItemType Directory -Path $empty -Force -ErrorAction Stop | Out-Null
+    Use-NativeErrors { & robocopy $empty $Path /MIR /NFL /NDL /NJH /NJS /NP *> $null }
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $empty -Recurse -Force -ErrorAction SilentlyContinue
+  } catch {}
+}
+
 # ----------------------------- locate the app --------------------------------
 # Returns the directory that contains the ChatGPT executable + resources\app.asar.
 function Find-SourceDir {
@@ -206,7 +231,9 @@ function Build {
   $asarNodePath = Get-AsarNodePath
 
   Info "Copying app -> $DestRoot"
-  if (Test-Path $DestRoot) { Remove-Item -Recurse -Force $DestRoot }
+  # A previous RTL build leaves deeply nested node_modules under
+  # app.asar.unpacked that exceed MAX_PATH, so use the long-path-safe remover.
+  Remove-Tree $DestRoot
   New-Item -ItemType Directory -Force -Path $DestRoot | Out-Null
   # robocopy is far faster than Copy-Item for large trees; /MIR mirrors exactly.
   Use-NativeErrors { & robocopy $srcDir $DestRoot /MIR /NFL /NDL /NJH /NJS /NP *> $null }
@@ -256,7 +283,7 @@ function Build {
 
     Info "Repacking app.asar (preserving native modules)"
     Remove-Item -Force $asar -ErrorAction SilentlyContinue
-    if (Test-Path $unpacked) { Remove-Item -Recurse -Force $unpacked }
+    Remove-Tree $unpacked
     $packScript = @'
 const asar = require("@electron/asar");
 const [src, out, unpackDir] = process.argv.slice(2);
@@ -290,7 +317,7 @@ asar.createPackageWithOptions(src, out, opts)
     (Get-ItemProperty $exe.FullName).VersionInfo.ProductVersion | Out-File -Encoding ascii $VersionFile
     Ok "Built $DestRoot"
   } finally {
-    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    Remove-Tree $work
     Remove-Item Env:\NODE_PATH -ErrorAction SilentlyContinue
   }
 }
@@ -377,11 +404,36 @@ function Invoke-Auto {
 function Invoke-Restore {
   Info "Removing auto-updater"
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+  # Windows locks the files of a running app, so if the RTL copy is open the
+  # delete below silently skips its locked files and leaves a half-removed
+  # folder behind. Close the running RTL copy first, then delete.
+  $rtlPrefix = (Resolve-Path $DestRoot -ErrorAction SilentlyContinue).Path
+  if ($rtlPrefix) {
+    $rtlProcs = Get-Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -match '(?i)^(ChatGPT|codex)$' -and $_.Path -and
+                     $_.Path.StartsWith($rtlPrefix, [StringComparison]::OrdinalIgnoreCase) }
+    if ($rtlProcs) {
+      Info "Closing the running ChatGPT RTL copy"
+      $rtlProcs | ForEach-Object { try { $_.CloseMainWindow() | Out-Null } catch {} }
+      Start-Sleep -Seconds 2
+      $rtlProcs | Where-Object { -not $_.HasExited } | ForEach-Object {
+        try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
+      }
+      Start-Sleep -Seconds 1
+    }
+  }
+
   Info "Removing $DestRoot"
-  Remove-Item -Recurse -Force $DestRoot -ErrorAction SilentlyContinue
+  Remove-Tree $DestRoot
   Remove-Item -Force $ShortcutPath -ErrorAction SilentlyContinue
-  Remove-Item -Recurse -Force $SupportDir -ErrorAction SilentlyContinue
-  Ok "Restored - the original ChatGPT app was never modified."
+  Remove-Tree $SupportDir
+
+  if (Test-Path $DestRoot) {
+    Info "note: some files under $DestRoot could not be removed. Close any ChatGPT RTL window and run -Restore again."
+  } else {
+    Ok "Restored - the original ChatGPT app was never modified."
+  }
 }
 
 # The RTL copy keeps the original app's identity (productName "Codex"), so it

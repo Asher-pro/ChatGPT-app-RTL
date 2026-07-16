@@ -354,6 +354,21 @@ $root = Join-Path $env:LOCALAPPDATA 'ChatGPT-RTL'
 $exe = Get-ChildItem -LiteralPath $root -Filter '*.exe' -ErrorAction SilentlyContinue |
   Where-Object { $_.Name -notmatch '(?i)helper|crashpad|update|squirrel' } |
   Sort-Object { $_.Name -notmatch '(?i)chatgpt|codex' } | Select-Object -First 1
+# The RTL copy runs with the original app's package identity, so it shares the
+# original's Electron single-instance lock (same userData). If the original is
+# running, launching the copy just forwards to the existing original window -
+# the user sees the unpatched app with no RTL. Close every instance that is NOT
+# our copy first, so the copy can take the lock and apply RTL.
+$notCopy = { $_.Name -match '(?i)^(ChatGPT|codex)$' -and $_.Path -and
+             -not $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }
+$orig = Get-Process -ErrorAction SilentlyContinue | Where-Object $notCopy
+if ($orig) {
+  $orig | ForEach-Object { try { $_.CloseMainWindow() | Out-Null } catch {} }
+  Start-Sleep -Seconds 2
+  Get-Process -ErrorAction SilentlyContinue | Where-Object $notCopy |
+    ForEach-Object { try { Stop-Process -Id $_.Id -Force } catch {} }
+  Start-Sleep -Seconds 1
+}
 '@
     if ($identity) {
       $fam = $identity.Family.Replace("'", "''")

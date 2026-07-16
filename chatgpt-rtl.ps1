@@ -361,13 +361,21 @@ $exe = Get-ChildItem -LiteralPath $root -Filter '*.exe' -ErrorAction SilentlyCon
 # our copy first, so the copy can take the lock and apply RTL.
 $notCopy = { $_.Name -match '(?i)^(ChatGPT|codex)$' -and $_.Path -and
              -not $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }
-$orig = Get-Process -ErrorAction SilentlyContinue | Where-Object $notCopy
-if ($orig) {
-  $orig | ForEach-Object { try { $_.CloseMainWindow() | Out-Null } catch {} }
-  Start-Sleep -Seconds 2
+if (Get-Process -ErrorAction SilentlyContinue | Where-Object $notCopy) {
+  # Ask nicely first, then force-kill. Poll and re-kill for up to ~8s: the app can
+  # respawn a background/tray process that keeps holding the single-instance lock.
   Get-Process -ErrorAction SilentlyContinue | Where-Object $notCopy |
-    ForEach-Object { try { Stop-Process -Id $_.Id -Force } catch {} }
-  Start-Sleep -Seconds 1
+    ForEach-Object { try { $_.CloseMainWindow() | Out-Null } catch {} }
+  for ($i = 0; $i -lt 16; $i++) {
+    $left = Get-Process -ErrorAction SilentlyContinue | Where-Object $notCopy
+    if (-not $left) { break }
+    $left | ForEach-Object { try { Stop-Process -Id $_.Id -Force } catch {} }
+    Start-Sleep -Milliseconds 500
+  }
+  # The Electron single-instance lock does not release the instant the process
+  # dies. Launch too soon and the copy still forwards to the (now-gone) original
+  # and quits, leaving nothing - or catches a respawned original. Wait it out.
+  Start-Sleep -Seconds 3
 }
 '@
     if ($identity) {

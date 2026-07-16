@@ -1,54 +1,57 @@
 <#
-  chatgpt-rtl.ps1 - add right-to-left (RTL) support to the ChatGPT/Codex desktop app on Windows.
+  chatgpt-rtl.ps1 - build a right-to-left (RTL) copy of the ChatGPT desktop app on Windows.
 
-  The unified app ships as an MSIX package under C:\Program Files\WindowsApps.
-  Its native code needs the MSIX *package identity* to start, so a separate copy
-  cannot run it and cannot load a patched app.asar. Therefore this patches the app
-  IN PLACE inside its install folder (the same approach the Claude Desktop patcher
-  uses), which keeps the package identity intact and makes the app load our patched
-  code directly. Requires administrator rights (it elevates automatically) and takes
-  ownership of the files it changes. Every changed file is backed up; -Restore puts
-  the originals back. A scheduled task re-applies the patch after the app updates
-  (or if Windows reverts it).
+  Produces %LOCALAPPDATA%\ChatGPT-RTL: a standalone, patched copy of the installed
+  ChatGPT app with smart bidirectional text support injected into every window
+  (both "ChatGPT Work" and "Codex" modes). The original app is never touched and
+  keeps updating normally. A Scheduled Task rebuilds the RTL copy automatically
+  whenever the original app is updated.
 
-  Usage (Windows PowerShell 5.1):
-    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1              # patch + auto-updater
-    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1 -NoWatch     # patch only
-    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1 -CloseApp    # close the app without prompting
-    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1 -Restore     # undo (restore originals)
-    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1 -Auto        # (internal) re-patch if changed
+  Usage (Windows PowerShell 5.1, run as Administrator only if the source is under
+  a protected path):
+    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1                 # build + auto-updater
+    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1 -NoWatch        # build only
+    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1 -CloseOriginal  # close original without prompting
+    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1 -Restore        # remove copy + task
+    powershell -ExecutionPolicy Bypass -File chatgpt-rtl.ps1 -Auto           # (internal) rebuild if changed
 
   Prerequisites: Node.js (provides `node` and `npx`) on PATH.
+
+  The RTL copy keeps the original app's identity, so it shares the Electron
+  single-instance lock: the original ChatGPT/Codex app must be closed for the RTL
+  copy to open with RTL applied. The build closes it for you (prompting first,
+  unless -CloseOriginal is given).
 #>
 [CmdletBinding()]
 param(
   [switch]$Restore,
   [switch]$NoWatch,
   [switch]$Auto,
-  [switch]$CloseApp
+  [switch]$CloseOriginal
 )
 
 $ErrorActionPreference = 'Stop'
 
 # When piped into PowerShell (irm | iex) the session runs under the machine's
-# default policy, which is usually Restricted and blocks npm/npx (.ps1 shims).
-# Relax the policy for THIS process only: no admin required, not persisted.
+# default policy, which is usually Restricted and blocks npm/npx - on Windows
+# those are .ps1 shims, so calling them fails with "running scripts is disabled".
+# Relax the policy for THIS process only: no admin required, not persisted, and
+# it also overrides a session started with -ExecutionPolicy Restricted.
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue } catch {}
 
 # ------------------------------- configuration -------------------------------
-$SupportDir      = Join-Path $env:LOCALAPPDATA 'chatgpt-rtl'
-$SelfCopy        = Join-Path $SupportDir 'chatgpt-rtl.ps1'
-$BackupDir       = Join-Path $SupportDir 'backup'
-$BkAsar          = Join-Path $BackupDir 'app.asar'
-$BkUnpacked      = Join-Path $BackupDir 'app.asar.unpacked'
-$BkExe           = Join-Path $BackupDir 'original.exe'
-$VersionFile     = Join-Path $SupportDir 'patched-version'
-$OrigHashFile    = Join-Path $SupportDir 'orig-hash.txt'
-$PatchedHashFile = Join-Path $SupportDir 'patched-hash.txt'
-$LogFile         = Join-Path $SupportDir 'updater.log'
-$TaskName        = 'ChatGPT RTL Updater'
-$RawUrl          = if ($env:CHATGPT_RTL_RAW_URL) { $env:CHATGPT_RTL_RAW_URL } else { 'https://raw.githubusercontent.com/Asher-pro/ChatGPT-app-RTL/main/chatgpt-rtl.ps1' }
-$AdminsSid       = '*S-1-5-32-544'   # BUILTIN\Administrators, locale-independent
+$AppName      = 'ChatGPT'
+$DestRoot     = Join-Path $env:LOCALAPPDATA 'ChatGPT-RTL'
+$SupportDir   = Join-Path $env:LOCALAPPDATA 'chatgpt-rtl'
+$SelfCopy     = Join-Path $SupportDir 'chatgpt-rtl.ps1'
+$VersionFile  = Join-Path $SupportDir 'patched-version'
+$LogFile      = Join-Path $SupportDir 'updater.log'
+$LauncherPath = Join-Path $SupportDir 'launch-rtl.ps1'
+$TaskName     = 'ChatGPT RTL Updater'
+$ShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'ChatGPT RTL.lnk'
+# Canonical location of this script, used by the auto-updater when the tool is
+# run piped (irm | iex) and therefore has no copy of itself on disk.
+$RawUrl       = if ($env:CHATGPT_RTL_RAW_URL) { $env:CHATGPT_RTL_RAW_URL } else { 'https://raw.githubusercontent.com/Asher-pro/ChatGPT-app-RTL/main/chatgpt-rtl.ps1' }
 
 function Info($m) { if (-not $Auto) { Write-Host "==> $m" -ForegroundColor Cyan } }
 function Ok($m)   { if (-not $Auto) { Write-Host " ok $m" -ForegroundColor Green } }
@@ -56,8 +59,8 @@ function Die($m)  { Write-Host "error $m" -ForegroundColor Red; exit 1 }
 
 # Windows PowerShell 5.1 turns any output a native tool writes to stderr into a
 # terminating error while $ErrorActionPreference is 'Stop' (e.g. npm/npx print an
-# "npm notice" banner to stderr). Run node/npx/takeown/icacls/robocopy through this
-# wrapper so their diagnostics don't abort; check $LASTEXITCODE for real failures.
+# "npm notice" update banner to stderr). Run node/npx/robocopy through this wrapper
+# so their diagnostics don't abort the build; check $LASTEXITCODE for real failures.
 function Use-NativeErrors {
   param([Parameter(Mandatory)][scriptblock]$Command)
   $prev = $ErrorActionPreference
@@ -65,14 +68,22 @@ function Use-NativeErrors {
   try { & $Command } finally { $ErrorActionPreference = $prev }
 }
 
-# Some app trees nest node_modules past the 260-char MAX_PATH limit, which
-# Remove-Item cannot delete. robocopy is long-path aware, so mirroring an empty
-# directory over the target clears it; then the empty top folder deletes normally.
+# The copied app nests node_modules deep enough to exceed the classic 260-char
+# MAX_PATH limit, and Remove-Item cannot delete those paths ("Could not find a
+# part of the path ..."). robocopy uses long-path-aware APIs, so mirroring an
+# empty directory over the target clears everything inside; then the now-empty
+# top folder deletes normally.
 function Remove-Tree {
   param([Parameter(Mandatory)][string]$Path)
+  # -LiteralPath throughout: on a non-ASCII profile (e.g. a Hebrew user name)
+  # TEMP can be an 8.3 short path like C:\Users\2922~1\..., and the tilde would
+  # be misread by the wildcard-aware -Path. Cleanup must never throw, so guarded.
   if (-not (Test-Path -LiteralPath $Path)) { return }
   try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop; return } catch {}
   if (-not (Test-Path -LiteralPath $Path)) { return }
+  # Long-path fallback: the copied app nests node_modules past MAX_PATH, which
+  # Remove-Item cannot delete. robocopy is long-path aware, so mirroring an empty
+  # directory over the target clears everything inside; then the shell removes it.
   try {
     $empty = Join-Path ([System.IO.Path]::GetTempPath()) ('cgptrtl_empty_' + [guid]::NewGuid())
     New-Item -ItemType Directory -Path $empty -Force -ErrorAction Stop | Out-Null
@@ -82,37 +93,19 @@ function Remove-Tree {
   } catch {}
 }
 
-# ------------------------------ elevation ------------------------------------
-function Test-Admin {
-  ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-   ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
-}
-
-# Patching files under WindowsApps requires administrator rights. Relaunch this
-# script elevated, preserving the switches. When run piped (no script file on
-# disk) we download a copy to %TEMP% so the elevated instance has something to run.
-function Invoke-Elevated {
-  $sp = $PSCommandPath
-  if (-not $sp -or -not (Test-Path $sp)) {
-    $sp = Join-Path $env:TEMP 'chatgpt-rtl.ps1'
-    try { Invoke-WebRequest -UseBasicParsing -Uri $RawUrl -OutFile $sp } catch { Die "could not download the script to elevate: $($_.Exception.Message)" }
-  }
-  $argl = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$sp`"")
-  foreach ($k in $PSBoundParameters.Keys) {
-    if ($PSBoundParameters[$k] -is [switch] -and $PSBoundParameters[$k]) { $argl += "-$k" }
-  }
-  $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-  try { Start-Process -FilePath $ps -Verb RunAs -ArgumentList $argl }
-  catch { Die "administrator rights are required. Approve the UAC prompt, or run PowerShell as Administrator." }
-}
-
 # ----------------------------- locate the app --------------------------------
-# Returns the app directory that contains resources\app.asar plus the launcher exe.
-function Find-AppDir {
+# Returns the directory that contains the ChatGPT executable + resources\app.asar.
+function Find-SourceDir {
   $candidates = @()
+
+  # Per-user / machine "Programs"-style installs (Squirrel/NSIS layouts).
   $candidates += Join-Path $env:LOCALAPPDATA 'Programs\ChatGPT'
   $candidates += Join-Path $env:LOCALAPPDATA 'Programs\Codex'
   $candidates += Join-Path ${env:ProgramFiles} 'ChatGPT'
+
+  # MSIX (Microsoft Store) install under WindowsApps. Get-AppxPackage's -Name
+  # parameter takes a single string, so filter with Where-Object to match any of
+  # the possible package identities (the unified app ships as "OpenAI.Codex").
   try {
     Get-AppxPackage -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -match '(?i)ChatGPT|OpenAI|Codex' -and $_.InstallLocation } |
@@ -121,6 +114,7 @@ function Find-AppDir {
 
   foreach ($dir in $candidates) {
     if (-not $dir) { continue }
+    # An Electron app: <dir>\resources\app.asar with the launcher exe next to resources\.
     $found = Get-ChildItem -Path $dir -Recurse -Filter 'app.asar' -ErrorAction SilentlyContinue |
              Where-Object { $_.FullName -match '\\resources\\app\.asar$' } | Select-Object -First 1
     if ($found) { return (Split-Path (Split-Path $found.FullName -Parent) -Parent) }
@@ -139,6 +133,28 @@ function Get-MainExe($appDir) {
   return $exe
 }
 
+# The unified ChatGPT/Codex app on Windows ships as an MSIX package. Its native
+# code calls WinRT APIs (e.g. ApplicationData.Current.LocalCacheFolder) that only
+# work when the process has a *package identity*. A plain copy under AppData has
+# none, so it crashes at startup with "Operation is not valid due to the current
+# state of the object". The fix is to launch our patched copy *with the original
+# package's identity* via Invoke-CommandInDesktopPackage. This resolves the source
+# package's family name and its manifest AppId; returns $null for non-MSIX
+# (Squirrel/NSIS) installs, which need no identity.
+function Get-SourceIdentity($srcDir) {
+  try {
+    $pkg = Get-AppxPackage -ErrorAction SilentlyContinue |
+           Where-Object { $_.InstallLocation -and $srcDir.StartsWith($_.InstallLocation, [StringComparison]::OrdinalIgnoreCase) } |
+           Select-Object -First 1
+    if (-not $pkg) { return $null }
+    $app = (Get-AppxPackageManifest $pkg).Package.Applications.Application
+    if ($app -is [array]) { $app = $app[0] }
+    $appId = $app.Id
+    if (-not $appId) { return $null }
+    return @{ Family = $pkg.PackageFamilyName; AppId = $appId }
+  } catch { return $null }
+}
+
 # Locate the @electron/asar module cached by npx, so we can call its Node API.
 function Get-AsarNodePath {
   Use-NativeErrors { & npx --yes @electron/asar --version *> $null }
@@ -151,40 +167,10 @@ function Get-AsarNodePath {
   return (Split-Path (Split-Path $mod.FullName -Parent) -Parent)   # ...\node_modules
 }
 
-# --------------------------- ownership / process -----------------------------
-function Grant-WriteFile($path) {
-  Use-NativeErrors { & takeown /f "$path" /d y *> $null }
-  Use-NativeErrors { & icacls "$path" /grant "$AdminsSid`:(F)" /c *> $null }
-}
-function Grant-WriteTree($path) {
-  Use-NativeErrors { & takeown /f "$path" /r /d y *> $null }
-  Use-NativeErrors { & icacls "$path" /grant "$AdminsSid`:(OI)(CI)F" /t /c *> $null }
-}
-
-# The app's files are locked while it runs, so it must be closed to patch it.
-function Close-App {
-  $procs = Get-Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match '(?i)^(ChatGPT|codex)$' -and $_.Path }
-  if (-not $procs) { return $true }
-  if (-not $CloseApp -and -not $Auto) {
-    Write-Host ""
-    Write-Host "ChatGPT/Codex is running and must be closed to patch it." -ForegroundColor Yellow
-    $ans = Read-Host "Close it now? (unsaved work will be lost) [y/N]"
-    if ($ans -notmatch '(?i)^y') { return $false }
-  }
-  Info "Closing ChatGPT/Codex"
-  $procs | ForEach-Object { try { $_.CloseMainWindow() | Out-Null } catch {} }
-  Start-Sleep -Seconds 2
-  Get-Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match '(?i)^(ChatGPT|codex)$' } |
-    ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }
-  Start-Sleep -Seconds 1
-  return $true
-}
-
 # ------------------------------ the RTL loader -------------------------------
 # Identical behaviour to the macOS build: attach to every web-contents and inject
-# CSS + a small bidi tagger. insertCSS runs at the Electron layer, bypassing CSP.
+# CSS + a small bidi tagger. insertCSS runs at the Electron layer, bypassing the
+# page's Content-Security-Policy.
 $Loader = @'
 /* __CGPT_RTL__ */
 'use strict';
@@ -266,10 +252,156 @@ try {
 }
 '@
 
+# --------------------------------- build -------------------------------------
+function Build {
+  $srcDir = Find-SourceDir
+  if (-not $srcDir) { Die "ChatGPT install not found. Install the ChatGPT desktop app first." }
+  Info "Source: $srcDir"
+
+  $asarNodePath = Get-AsarNodePath
+
+  Info "Copying app -> $DestRoot"
+  # A previous RTL build leaves deeply nested node_modules under
+  # app.asar.unpacked that exceed MAX_PATH, so use the long-path-safe remover.
+  Remove-Tree $DestRoot
+  New-Item -ItemType Directory -Force -Path $DestRoot | Out-Null
+  # robocopy is far faster than Copy-Item for large trees; /MIR mirrors exactly.
+  Use-NativeErrors { & robocopy $srcDir $DestRoot /MIR /NFL /NDL /NJH /NJS /NP *> $null }
+  if ($LASTEXITCODE -ge 8) { Die "copy failed (robocopy exit $LASTEXITCODE)" }
+
+  $asar     = Join-Path $DestRoot 'resources\app.asar'
+  $unpacked = Join-Path $DestRoot 'resources\app.asar.unpacked'
+  if (-not (Test-Path $asar)) { Die "app.asar not found under $DestRoot\resources" }
+
+  $exe = Get-MainExe $DestRoot
+  if (-not $exe) { Die "could not find the ChatGPT executable in $DestRoot" }
+
+  $work = Join-Path ([System.IO.Path]::GetTempPath()) ("cgptrtl_" + [System.IO.Path]::GetRandomFileName())
+  New-Item -ItemType Directory -Force -Path $work | Out-Null
+  try {
+    # Original header hash, needed later to find/replace it inside the exe.
+    $oldHash = Get-AsarHeaderHash $asar $asarNodePath
+
+    Info "Extracting app.asar"
+    Use-NativeErrors { & npx --yes @electron/asar extract "$asar" (Join-Path $work 'app') }
+    if ($LASTEXITCODE -ne 0) { Die "asar extract failed" }
+    # Overlay the authoritative native-module tree (extract can miss sidecar files).
+    if (Test-Path $unpacked) {
+      Use-NativeErrors { & robocopy $unpacked (Join-Path $work 'app') /E /NFL /NDL /NJH /NJS /NP *> $null }
+    }
+
+    $mainRel  = Use-NativeErrors { & node -p "require('$((Join-Path $work 'app\package.json') -replace '\\','/')').main" }
+    $mainFile = Join-Path $work (Join-Path 'app' $mainRel)
+    if (-not (Test-Path $mainFile)) { Die "main entry '$mainRel' not found in app.asar" }
+
+    Info "Injecting RTL loader into $mainRel"
+    $loaderPath = Join-Path (Split-Path $mainFile -Parent) '__cgpt_rtl__.js'
+    [System.IO.File]::WriteAllText($loaderPath, $Loader, (New-Object System.Text.UTF8Encoding($false)))
+    $mainText = [System.IO.File]::ReadAllText($mainFile)
+    if ($mainText -notmatch '__CGPT_RTL__') {
+      $mainText = "/* __CGPT_RTL__ */try{require('./__cgpt_rtl__.js');}catch(e){}`n" + $mainText
+      [System.IO.File]::WriteAllText($mainFile, $mainText, (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    # Build the unpack-dir glob from the packages that were unpacked originally.
+    $glob = ''
+    $nmDir = Join-Path $unpacked 'node_modules'
+    if (Test-Path $nmDir) {
+      $names = (Get-ChildItem -Path $nmDir -Directory | ForEach-Object { $_.Name }) -join '|'
+      if ($names) { $glob = "node_modules/@($names)" }
+    }
+
+    Info "Repacking app.asar (preserving native modules)"
+    Remove-Item -Force $asar -ErrorAction SilentlyContinue
+    Remove-Tree $unpacked
+    $packScript = @'
+const asar = require("@electron/asar");
+const [src, out, unpackDir] = process.argv.slice(2);
+const opts = { unpack: "**/*.node" };
+if (unpackDir) opts.unpackDir = unpackDir;
+asar.createPackageWithOptions(src, out, opts)
+  .then(() => process.exit(0))
+  .catch((err) => { console.error(err); process.exit(1); });
+'@
+    $packFile = Join-Path $work 'pack.js'
+    [System.IO.File]::WriteAllText($packFile, $packScript)
+    $env:NODE_PATH = $asarNodePath
+    Use-NativeErrors { & node $packFile (Join-Path $work 'app') $asar $glob }
+    if ($LASTEXITCODE -ne 0) { Die "asar repack failed" }
+
+    Info "Updating ASAR integrity hash"
+    $newHash = Get-AsarHeaderHash $asar $asarNodePath
+    if (-not $newHash) { Die "could not compute new asar hash" }
+    Set-ExeAsarHash $exe.FullName $oldHash $newHash $DestRoot $asarNodePath
+
+    New-Item -ItemType Directory -Force -Path $SupportDir | Out-Null
+
+    Info "Writing launcher"
+    # The patched copy must start with the original MSIX package identity, or its
+    # WinRT calls crash. Generate a launcher that does exactly that; regenerated on
+    # every build so the identity stays current.
+    #
+    # The launcher must NOT embed the destination path as a string literal: on a
+    # non-ASCII profile (e.g. a Hebrew user name) the path contains characters that
+    # Windows PowerShell 5.1 mangles, because it reads a BOM-less .ps1 as ANSI. So
+    # the launcher discovers its own exe from $env:LOCALAPPDATA at run time (env
+    # vars are always correct Unicode), and we write the file WITH a UTF-8 BOM so
+    # 5.1 decodes it correctly regardless.
+    $identity = Get-SourceIdentity $srcDir
+    $find = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$root = Join-Path $env:LOCALAPPDATA 'ChatGPT-RTL'
+$exe = Get-ChildItem -LiteralPath $root -Filter '*.exe' -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -notmatch '(?i)helper|crashpad|update|squirrel' } |
+  Sort-Object { $_.Name -notmatch '(?i)chatgpt|codex' } | Select-Object -First 1
+'@
+    if ($identity) {
+      $fam = $identity.Family.Replace("'", "''")
+      $aid = $identity.AppId.Replace("'", "''")
+      $launcher = @"
+# Auto-generated by chatgpt-rtl. Launches the patched RTL copy with the original
+# MSIX package identity, so the app's WinRT APIs (ApplicationData.Current) work.
+$find
+if (`$exe) {
+  try { Invoke-CommandInDesktopPackage -PackageFamilyName '$fam' -AppId '$aid' -Command `$exe.FullName -PreventBreakaway }
+  catch { Start-Process `$exe.FullName }
+}
+"@
+    } else {
+      # Non-MSIX install (Squirrel/NSIS): no package identity needed.
+      $launcher = @"
+$find
+if (`$exe) { Start-Process `$exe.FullName }
+"@
+    }
+    # UTF-8 *with* BOM so Windows PowerShell 5.1 reads the script as UTF-8.
+    [System.IO.File]::WriteAllText($LauncherPath, $launcher, (New-Object System.Text.UTF8Encoding($true)))
+
+    Info "Creating shortcut"
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $ws = New-Object -ComObject WScript.Shell
+    $sc = $ws.CreateShortcut($ShortcutPath)
+    $sc.TargetPath = $psExe
+    $sc.Arguments  = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LauncherPath`""
+    $sc.WorkingDirectory = $DestRoot
+    $sc.IconLocation = "$($exe.FullName),0"
+    $sc.Description = 'ChatGPT RTL'
+    $sc.Save()
+
+    # Record the patched version for the auto-updater.
+    (Get-ItemProperty $exe.FullName).VersionInfo.ProductVersion | Out-File -Encoding ascii $VersionFile
+    Ok "Built $DestRoot"
+  } finally {
+    Remove-Tree $work
+    Remove-Item Env:\NODE_PATH -ErrorAction SilentlyContinue
+  }
+}
+
 function Get-AsarHeaderHash($asarPath, $nodePath) {
   $env:NODE_PATH = $nodePath
-  # Single quotes inside the JS: PowerShell 5.1 strips embedded double quotes when
-  # passing a string as a native-command argument, which would corrupt the script.
+  # Use single quotes inside the JS: Windows PowerShell 5.1 strips embedded double
+  # quotes when passing a string as a native-command argument, which would corrupt
+  # the script before node ever sees it.
   $nodeScript = "const a=require('@electron/asar'),c=require('crypto');process.stdout.write(c.createHash('sha256').update(a.getRawHeader(process.argv[1]).headerString).digest('hex'));"
   $h = Use-NativeErrors { & node -e $nodeScript $asarPath }
   Remove-Item Env:\NODE_PATH -ErrorAction SilentlyContinue
@@ -277,8 +409,8 @@ function Get-AsarHeaderHash($asarPath, $nodePath) {
 }
 
 # Electron validates the app.asar header hash against a value baked into the exe.
-# Replace the old hash with the new one; if it isn't found, fall back to disabling
-# the integrity fuse. The exe passed in must be pristine (embeds the original hash).
+# Replace the old hash with the new one; if it isn't found (different storage),
+# fall back to disabling the integrity fuse.
 function Set-ExeAsarHash($exePath, $oldHash, $newHash, $appDir, $nodePath) {
   if ($oldHash -and $newHash -and ($oldHash.Length -eq $newHash.Length)) {
     $bytes    = [System.IO.File]::ReadAllBytes($exePath)
@@ -300,124 +432,8 @@ function Set-ExeAsarHash($exePath, $oldHash, $newHash, $appDir, $nodePath) {
   Info "Integrity hash not embedded in exe - disabling the integrity fuse instead"
   Use-NativeErrors { & npx --yes @electron/fuses write --app $appDir EnableEmbeddedAsarIntegrityValidation=off *> $null }
   if ($LASTEXITCODE -ne 0) {
-    Info "note: could not adjust the integrity fuse; if the app refuses to start, this version needs the fuse-flip step"
+    Info "note: could not adjust the integrity fuse; if the app refuses to start, the build needs the fuse-flip step for this version"
   }
-}
-
-# --------------------------- patch (in place) --------------------------------
-function Invoke-Patch {
-  $appDir = Find-AppDir
-  if (-not $appDir) { Die "ChatGPT install not found. Install the ChatGPT desktop app first." }
-  $resources = Join-Path $appDir 'resources'
-  $asar      = Join-Path $resources 'app.asar'
-  $unpacked  = Join-Path $resources 'app.asar.unpacked'
-  if (-not (Test-Path $asar)) { Die "app.asar not found under $resources" }
-  $exe = Get-MainExe $appDir
-  if (-not $exe) { Die "could not find the ChatGPT executable in $appDir" }
-  $ver = (Get-ItemProperty $exe.FullName).VersionInfo.ProductVersion
-  Info "App: $appDir  (v$ver)"
-
-  $nodePath = Get-AsarNodePath
-
-  if (-not (Close-App)) { Die "the app must be closed to patch it. Re-run and choose Yes (or pass -CloseApp)." }
-
-  New-Item -ItemType Directory -Force -Path $SupportDir | Out-Null
-
-  $curHash     = Get-AsarHeaderHash $asar $nodePath
-  $savedOrig   = if (Test-Path $OrigHashFile)    { (Get-Content $OrigHashFile -Raw).Trim() }    else { '' }
-  $savedPatch  = if (Test-Path $PatchedHashFile) { (Get-Content $PatchedHashFile -Raw).Trim() } else { '' }
-  $havePristine   = (Test-Path $BkAsar) -and $savedOrig
-  $isKnownPatched = $savedPatch -and ($curHash -eq $savedPatch)
-  $isKnownOrig    = $savedOrig  -and ($curHash -eq $savedOrig)
-
-  # Idempotency for the auto-updater: nothing to do if already our patch + same version.
-  if ($Auto -and $isKnownPatched -and (Test-Path $VersionFile) -and ((Get-Content $VersionFile -Raw).Trim() -eq $ver)) {
-    return
-  }
-
-  Info "Taking ownership of app files"
-  Grant-WriteTree $resources
-  Grant-WriteFile $exe.FullName
-
-  # (Re)create the pristine backup when the in-place asar is an original we don't
-  # yet have backed up - i.e. a fresh install or a new version after an update.
-  if (-not $havePristine -or (-not $isKnownPatched -and -not $isKnownOrig)) {
-    Info "Backing up original files"
-    New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
-    Copy-Item -LiteralPath $asar -Destination $BkAsar -Force
-    Remove-Tree $BkUnpacked
-    if (Test-Path $unpacked) { Use-NativeErrors { & robocopy $unpacked $BkUnpacked /MIR /NFL /NDL /NJH /NJS /NP *> $null } }
-    Copy-Item -LiteralPath $exe.FullName -Destination $BkExe -Force
-    $curHash | Out-File -Encoding ascii $OrigHashFile
-    $savedOrig = $curHash
-  }
-  $oldHash = $savedOrig
-
-  $work = Join-Path ([System.IO.Path]::GetTempPath()) ("cgptrtl_" + [System.IO.Path]::GetRandomFileName())
-  New-Item -ItemType Directory -Force -Path $work | Out-Null
-  try {
-    Info "Extracting app.asar (from pristine backup)"
-    Use-NativeErrors { & npx --yes @electron/asar extract "$BkAsar" (Join-Path $work 'app') }
-    if ($LASTEXITCODE -ne 0) { Die "asar extract failed" }
-    if (Test-Path $BkUnpacked) {
-      Use-NativeErrors { & robocopy $BkUnpacked (Join-Path $work 'app') /E /NFL /NDL /NJH /NJS /NP *> $null }
-    }
-
-    $mainRel  = Use-NativeErrors { & node -p "require('$((Join-Path $work 'app\package.json') -replace '\\','/')').main" }
-    $mainFile = Join-Path $work (Join-Path 'app' $mainRel)
-    if (-not (Test-Path $mainFile)) { Die "main entry '$mainRel' not found in app.asar" }
-
-    Info "Injecting RTL loader into $mainRel"
-    $loaderPath = Join-Path (Split-Path $mainFile -Parent) '__cgpt_rtl__.js'
-    [System.IO.File]::WriteAllText($loaderPath, $Loader, (New-Object System.Text.UTF8Encoding($false)))
-    $mainText = [System.IO.File]::ReadAllText($mainFile)
-    if ($mainText -notmatch '__CGPT_RTL__') {
-      $mainText = "/* __CGPT_RTL__ */try{require('./__cgpt_rtl__.js');}catch(e){}`n" + $mainText
-      [System.IO.File]::WriteAllText($mainFile, $mainText, (New-Object System.Text.UTF8Encoding($false)))
-    }
-
-    $glob = ''
-    $nmDir = Join-Path $BkUnpacked 'node_modules'
-    if (Test-Path $nmDir) {
-      $names = (Get-ChildItem -Path $nmDir -Directory | ForEach-Object { $_.Name }) -join '|'
-      if ($names) { $glob = "node_modules/@($names)" }
-    }
-
-    Info "Repacking app.asar in place (preserving native modules)"
-    Remove-Item -Force $asar -ErrorAction SilentlyContinue
-    Remove-Tree $unpacked
-    $packScript = @'
-const asar = require("@electron/asar");
-const [src, out, unpackDir] = process.argv.slice(2);
-const opts = { unpack: "**/*.node" };
-if (unpackDir) opts.unpackDir = unpackDir;
-asar.createPackageWithOptions(src, out, opts)
-  .then(() => process.exit(0))
-  .catch((err) => { console.error(err); process.exit(1); });
-'@
-    $packFile = Join-Path $work 'pack.js'
-    [System.IO.File]::WriteAllText($packFile, $packScript)
-    $env:NODE_PATH = $nodePath
-    Use-NativeErrors { & node $packFile (Join-Path $work 'app') $asar $glob }
-    Remove-Item Env:\NODE_PATH -ErrorAction SilentlyContinue
-    if ($LASTEXITCODE -ne 0) { Die "asar repack failed (is the app closed and are the files writable?)" }
-
-    Info "Updating ASAR integrity hash"
-    $newHash = Get-AsarHeaderHash $asar $nodePath
-    if (-not $newHash) { Die "could not compute new asar hash" }
-    # Restore the pristine exe first, so the original hash is present to find/replace.
-    Copy-Item -LiteralPath $BkExe -Destination $exe.FullName -Force
-    Set-ExeAsarHash $exe.FullName $oldHash $newHash $appDir $nodePath
-
-    $ver     | Out-File -Encoding ascii $VersionFile
-    $newHash | Out-File -Encoding ascii $PatchedHashFile
-    Ok "Patched in place: $appDir"
-  } finally {
-    Remove-Tree $work
-    Remove-Item Env:\NODE_PATH -ErrorAction SilentlyContinue
-  }
-
-  return $exe.FullName
 }
 
 # --------------------------- auto-update watcher -----------------------------
@@ -426,23 +442,28 @@ function Install-Watch {
   if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
     Copy-Item -Force $PSCommandPath $SelfCopy
   } else {
+    # Piped install (irm | iex) - fetch a copy so the updater can re-run it.
     Info "Fetching script for the auto-updater"
     try { Invoke-WebRequest -UseBasicParsing -Uri $RawUrl -OutFile $SelfCopy }
-    catch { Info "note: couldn't fetch the updater script; auto-update disabled (re-run the installer after updates)"; return }
+    catch { Info "note: couldn't fetch the updater script; auto-update disabled (re-run the installer after app updates)"; return }
   }
 
-  $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfCopy`" -Auto"
-  # Logon + daily, and re-patch runs elevated (in-place patching needs admin).
+  $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
+             -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfCopy`" -Auto"
+  # Fire on logon, and daily as a backstop. (Electron updates land in-place or in
+  # a new version dir; -Auto compares versions and rebuilds only when needed.)
   $t1 = New-ScheduledTaskTrigger -AtLogOn
   $t2 = New-ScheduledTaskTrigger -Daily -At 3am
-  $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-  $me        = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-  $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest
+  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+  # Register as an interactive, limited (non-elevated) task for the current user,
+  # so it installs without administrator rights (the default principal targets the
+  # machine task store and fails with "Access is denied" for a standard user).
+  $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
   try {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($t1, $t2) `
       -Settings $settings -Principal $principal -Force `
-      -Description 'Re-applies the ChatGPT RTL patch after the app updates or is reverted.' | Out-Null
+      -Description 'Rebuilds the ChatGPT RTL copy after the app updates.' | Out-Null
     Ok "Installed auto-updater (Scheduled Task '$TaskName')"
   } catch {
     Info "note: could not register the Scheduled Task ($($_.Exception.Message)). Re-run this script after each app update."
@@ -450,21 +471,14 @@ function Install-Watch {
 }
 
 function Invoke-Auto {
-  $appDir = Find-AppDir
-  if (-not $appDir) { return }
-  $exe = Get-MainExe $appDir
-  if (-not $exe) { return }
-  $asar = Join-Path (Join-Path $appDir 'resources') 'app.asar'
-  $ver  = (Get-ItemProperty $exe.FullName).VersionInfo.ProductVersion
-  $prevVer = if (Test-Path $VersionFile) { (Get-Content $VersionFile -Raw).Trim() } else { '' }
-  $savedPatch = if (Test-Path $PatchedHashFile) { (Get-Content $PatchedHashFile -Raw).Trim() } else { '' }
-  $curHash = try { Get-AsarHeaderHash $asar (Get-AsarNodePath) } catch { '' }
-  # Re-patch when the app updated (version changed) or the patch was reverted
-  # (in-place hash no longer matches ours, e.g. MSIX self-healing).
-  if (($ver -ne $prevVer) -or (-not $savedPatch) -or ($curHash -ne $savedPatch)) {
-    "[{0}] re-patching (ver '{1}'->'{2}', patched={3}, cur={4})" -f (Get-Date), $prevVer, $ver, $savedPatch, $curHash |
-      Out-File -Append -Encoding utf8 $LogFile
-    Invoke-Patch | Out-Null
+  $srcDir = Find-SourceDir
+  if (-not $srcDir) { return }
+  $exe = Get-MainExe $srcDir
+  $cur = if ($exe) { (Get-ItemProperty $exe.FullName).VersionInfo.ProductVersion } else { '' }
+  $prev = if (Test-Path $VersionFile) { (Get-Content $VersionFile -Raw).Trim() } else { '' }
+  if ((-not (Test-Path $DestRoot)) -or ($cur -ne $prev)) {
+    "[{0}] rebuilding RTL app (was '{1}', now '{2}')" -f (Get-Date), $prev, $cur | Out-File -Append -Encoding utf8 $LogFile
+    Build
   }
 }
 
@@ -472,41 +486,83 @@ function Invoke-Restore {
   Info "Removing auto-updater"
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-  $appDir = Find-AppDir
-  if ($appDir -and (Test-Path $BkAsar)) {
-    if (-not (Close-App)) { Die "close the app first, then run -Restore again." }
-    $resources = Join-Path $appDir 'resources'
-    $asar      = Join-Path $resources 'app.asar'
-    $unpacked  = Join-Path $resources 'app.asar.unpacked'
-    $exe       = Get-MainExe $appDir
-    Info "Restoring original files"
-    Grant-WriteTree $resources
-    if ($exe) { Grant-WriteFile $exe.FullName }
-    Copy-Item -LiteralPath $BkAsar -Destination $asar -Force
-    Remove-Tree $unpacked
-    if (Test-Path $BkUnpacked) { Use-NativeErrors { & robocopy $BkUnpacked $unpacked /MIR /NFL /NDL /NJH /NJS /NP *> $null } }
-    if ($exe -and (Test-Path $BkExe)) { Copy-Item -LiteralPath $BkExe -Destination $exe.FullName -Force }
-    Ok "Restored the original app.asar and exe"
-  } else {
-    Info "No backup found - nothing to restore in the app folder."
+  # Windows locks the files of a running app, so if the RTL copy is open the
+  # delete below silently skips its locked files and leaves a half-removed
+  # folder behind. Close the running RTL copy first, then delete.
+  $rtlPrefix = (Resolve-Path $DestRoot -ErrorAction SilentlyContinue).Path
+  if ($rtlPrefix) {
+    $rtlProcs = Get-Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -match '(?i)^(ChatGPT|codex)$' -and $_.Path -and
+                     $_.Path.StartsWith($rtlPrefix, [StringComparison]::OrdinalIgnoreCase) }
+    if ($rtlProcs) {
+      Info "Closing the running ChatGPT RTL copy"
+      $rtlProcs | ForEach-Object { try { $_.CloseMainWindow() | Out-Null } catch {} }
+      Start-Sleep -Seconds 2
+      $rtlProcs | Where-Object { -not $_.HasExited } | ForEach-Object {
+        try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
+      }
+      Start-Sleep -Seconds 1
+    }
   }
+
+  Info "Removing $DestRoot"
+  Remove-Tree $DestRoot
+  Remove-Item -Force $ShortcutPath -ErrorAction SilentlyContinue
   Remove-Tree $SupportDir
-  Ok "Done."
+
+  if (Test-Path $DestRoot) {
+    Info "note: some files under $DestRoot could not be removed. Close any ChatGPT RTL window and run -Restore again."
+  } else {
+    Ok "Restored - the original ChatGPT app was never modified."
+  }
+}
+
+# The RTL copy keeps the original app's identity (productName "Codex"), so it
+# shares the same userData directory and therefore the same Electron
+# single-instance lock. If the original app is already running when the RTL copy
+# launches, Electron hands the launch off to the original window and the RTL copy
+# quits immediately - the user sees the unpatched app and no RTL. Closing the
+# original first is the only way the RTL copy can take the lock and apply RTL.
+function Stop-OriginalInstances {
+  $rtlPrefix = (Resolve-Path $DestRoot -ErrorAction SilentlyContinue).Path
+  $running = Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '(?i)^(ChatGPT|codex)$' -and $_.Path } |
+    Where-Object { -not ($rtlPrefix -and $_.Path.StartsWith($rtlPrefix, [StringComparison]::OrdinalIgnoreCase)) }
+  if (-not $running) { return $true }
+
+  if (-not $CloseOriginal) {
+    Write-Host ""
+    Write-Host "The original ChatGPT/Codex app is running. It holds the single-instance" -ForegroundColor Yellow
+    Write-Host "lock, so the RTL copy cannot open with RTL until it is closed." -ForegroundColor Yellow
+    $ans = Read-Host "Close the original app now? (unsaved work in it will be lost) [y/N]"
+    if ($ans -notmatch '(?i)^y') {
+      Info "Leaving the original running. Launch 'ChatGPT RTL' after you close it manually."
+      return $false
+    }
+  }
+
+  Info "Closing the original ChatGPT/Codex app"
+  $running | ForEach-Object { try { $_.CloseMainWindow() | Out-Null } catch {} }
+  Start-Sleep -Seconds 2
+  $running | Where-Object { -not $_.HasExited } | ForEach-Object {
+    try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
+  }
+  return $true
 }
 
 # --------------------------------- dispatch ----------------------------------
-# Everything below needs administrator rights; elevate once, up front.
-if (-not (Test-Admin)) {
-  Info "Requesting administrator rights (approve the UAC prompt)..."
-  Invoke-Elevated
-  return
-}
-
 if ($Restore) { Invoke-Restore; return }
 if ($Auto)    { Invoke-Auto;    return }
 
-$exePath = Invoke-Patch
+Build
 if (-not $NoWatch) { Install-Watch }
-Info "Launching ChatGPT"
-try { if ($exePath) { Start-Process $exePath } } catch {}
+$closed = Stop-OriginalInstances
+if ($closed -and (Test-Path $LauncherPath)) {
+  Info "Launching ChatGPT RTL"
+  # Launch through the identity-aware launcher (same path the shortcut uses).
+  $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  Start-Process $psExe -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LauncherPath`""
+} else {
+  Info "Skipping launch. Start 'ChatGPT RTL' from the desktop shortcut once the original is closed."
+}
 Ok "Done. Type Hebrew in Work or Codex mode to see RTL alignment."
